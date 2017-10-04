@@ -17,7 +17,9 @@ package metrics
 import (
 	"fmt"
 	"io"
+	"math"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,13 +33,36 @@ type Provider interface {
 	// WriteMetrics will write a summary of the metrics to w.
 	WriteMetrics(w io.Writer)
 
+	AddDiff(key, value string)
+
 	// Reset clears the metric store.
 	Reset()
+}
+
+type diff struct {
+	baseline string
+	count    int
+	simSum   int
+}
+
+func (d *diff) add(v string) *diff {
+	if d.baseline == "" {
+		d.baseline = v
+		d.count = 1
+		d.simSum = 100 // If we get only one it is very cache friendly.
+		return d
+	}
+
+	d.simSum += similarPercentage(v, d.baseline)
+	d.count++
+
+	return d
 }
 
 // Store provides storage for a set of metrics.
 type Store struct {
 	metrics map[string][]time.Duration
+	diffs   map[string]*diff
 	mu      *sync.Mutex
 }
 
@@ -45,6 +70,7 @@ type Store struct {
 func NewProvider() Provider {
 	return &Store{
 		metrics: make(map[string][]time.Duration),
+		diffs:   make(map[string]*diff),
 		mu:      &sync.Mutex{},
 	}
 }
@@ -53,6 +79,24 @@ func NewProvider() Provider {
 func (s *Store) Reset() {
 	s.mu.Lock()
 	s.metrics = make(map[string][]time.Duration)
+	s.diffs = make(map[string]*diff)
+	s.mu.Unlock()
+}
+
+func (s *Store) AddDiff(key, value string) {
+	s.mu.Lock()
+	var (
+		d     *diff
+		found bool
+	)
+
+	d, found = s.diffs[key]
+
+	if !found {
+		d = &diff{}
+		s.diffs[key] = d
+	}
+	d.add(value)
 	s.mu.Unlock()
 }
 
@@ -74,6 +118,12 @@ func (s *Store) WriteMetrics(w io.Writer) {
 		var sum time.Duration
 		var max time.Duration
 
+		diff, found := s.diffs[k]
+		cacheFactor := 0
+		if found {
+			cacheFactor = diff.simSum / diff.count
+		}
+
 		for _, d := range v {
 			sum += d
 			if d > max {
@@ -83,31 +133,32 @@ func (s *Store) WriteMetrics(w io.Writer) {
 
 		avg := time.Duration(int(sum) / len(v))
 
-		results[i] = result{key: k, count: len(v), max: max, sum: sum, avg: avg}
+		results[i] = result{key: k, count: len(v), max: max, sum: sum, avg: avg, cacheFactor: cacheFactor}
 		i++
 	}
 
 	s.mu.Unlock()
 
 	// sort and print results
-	fmt.Fprintf(w, "  %13s  %12s  %12s  %5s  %s\n", "cumulative", "average", "maximum", "", "")
-	fmt.Fprintf(w, "  %13s  %12s  %12s  %5s  %s\n", "duration", "duration", "duration", "count", "template")
-	fmt.Fprintf(w, "  %13s  %12s  %12s  %5s  %s\n", "----------", "--------", "--------", "-----", "--------")
+	fmt.Fprintf(w, "  %9s  %13s  %12s  %12s  %5s  %s\n", "cache", "cumulative", "average", "maximum", "", "")
+	fmt.Fprintf(w, "  %9s  %13s  %12s  %12s  %5s  %s\n", "potential", "duration", "duration", "duration", "count", "template")
+	fmt.Fprintf(w, "  %9s  %13s  %12s  %12s  %5s  %s\n", "-----", "----------", "--------", "--------", "-----", "--------")
 
 	sort.Sort(bySum(results))
 	for _, v := range results {
-		fmt.Fprintf(w, "  %13s  %12s  %12s  %5d  %s\n", v.sum, v.avg, v.max, v.count, v.key)
+		fmt.Fprintf(w, "  %9d %13s  %12s  %12s  %5d  %s\n", v.cacheFactor, v.sum, v.avg, v.max, v.count, v.key)
 	}
 
 }
 
 // A result represents the calculated results for a given metric.
 type result struct {
-	key   string
-	count int
-	sum   time.Duration
-	max   time.Duration
-	avg   time.Duration
+	key         string
+	count       int
+	cacheFactor int
+	sum         time.Duration
+	max         time.Duration
+	avg         time.Duration
 }
 
 type bySum []result
@@ -115,3 +166,24 @@ type bySum []result
 func (b bySum) Len() int           { return len(b) }
 func (b bySum) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b bySum) Less(i, j int) bool { return b[i].sum > b[j].sum }
+
+// similarPercentage is a naive diff implementation that returns
+// a number between 0-100 indicating how similar a and b are.
+// 100 is when all words in a also exists in b.
+func similarPercentage(a, b string) int {
+	if a == b {
+		return 100
+	}
+	af, bf := strings.Fields(a), strings.Fields(b)
+	mb := map[string]bool{}
+	for _, x := range bf {
+		mb[x] = true
+	}
+	common := 0
+	for _, x := range af {
+		if _, ok := mb[x]; ok {
+			common++
+		}
+	}
+	return int(math.Floor((float64(common) / float64(len(af)) * 100) + 0.5))
+}
